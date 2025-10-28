@@ -1,0 +1,152 @@
+name: Create backlog issues
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List issues without creating them"
+        required: false
+        default: "false"
+
+jobs:
+  create-issues:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create or update backlog issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const core = require('@actions/core');
+
+            const dryRun = (core.getInput('dry_run') || 'false').toLowerCase() === 'true';
+            const issuesDir = '.github/issues';
+
+            if (!fs.existsSync(issuesDir)) {
+              core.setFailed(`Directory ${issuesDir} does not exist.`);
+              return;
+            }
+
+            const files = fs
+              .readdirSync(issuesDir)
+              .filter((file) => file.toLowerCase().endsWith('.md'))
+              .sort();
+
+            if (files.length === 0) {
+              core.info(`No issue definition files found under ${issuesDir}.`);
+              return;
+            }
+
+            core.info(`Found ${files.length} issue definition files.`);
+
+            const existingIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              per_page: 100,
+            });
+
+            const existingTitles = new Set(existingIssues.map((issue) => issue.title));
+            core.info(`Repository currently has ${existingTitles.size} issues (all states).`);
+
+            const parseFrontMatter = (text) => {
+              const metadata = {};
+              let currentKey = null;
+
+              const lines = text.split('\n');
+              for (const rawLine of lines) {
+                const line = rawLine.replace(/\s+$/u, '');
+                if (!line.trim()) {
+                  continue;
+                }
+
+                if (!line.startsWith(' ') && line.includes(':')) {
+                  const [rawKey, ...rawValueParts] = line.split(':');
+                  const key = rawKey.trim();
+                  const rawValue = rawValueParts.join(':').trim();
+
+                  if (rawValue) {
+                    const normalizedValue = rawValue.replace(/^['"]|['"]$/g, '');
+                    metadata[key] = normalizedValue;
+                    currentKey = null;
+                  } else {
+                    metadata[key] = [];
+                    currentKey = key;
+                  }
+                  continue;
+                }
+
+                if (line.trimStart().startsWith('- ')) {
+                  if (!currentKey) {
+                    continue;
+                  }
+                  const value = line.trim().slice(2).trim().replace(/^['"]|['"]$/g, '');
+                  if (!Array.isArray(metadata[currentKey])) {
+                    metadata[currentKey] = [];
+                  }
+                  metadata[currentKey].push(value);
+                  continue;
+                }
+
+                if (currentKey && Array.isArray(metadata[currentKey]) && metadata[currentKey].length > 0) {
+                  const lastIndex = metadata[currentKey].length - 1;
+                  metadata[currentKey][lastIndex] = `${metadata[currentKey][lastIndex]}\n${line.trim()}`;
+                }
+              }
+
+              return metadata;
+            };
+
+            for (const file of files) {
+              const fullPath = path.join(issuesDir, file);
+              const content = fs.readFileSync(fullPath, 'utf8');
+
+              const frontMatterMatch = content.match(/^---\n([\s\S]*?)\n---\n?/u);
+              let metadata = {};
+              let body = content;
+
+              if (frontMatterMatch) {
+                metadata = parseFrontMatter(frontMatterMatch[1]);
+                body = content.slice(frontMatterMatch[0].length).trim();
+              }
+
+              const headingMatch = body.match(/^#\s+(.+?)\s*$/m);
+              const fallbackTitle = headingMatch ? headingMatch[1].trim() : null;
+              const title = (metadata.title || fallbackTitle || `Imported issue from ${file}`).trim();
+
+              let labels = metadata.labels;
+              if (!Array.isArray(labels)) {
+                labels = typeof labels === 'string' && labels
+                  ? labels.split(',').map((label) => label.trim()).filter(Boolean)
+                  : [];
+              }
+
+              if (existingTitles.has(title)) {
+                core.info(`Skipping '${title}' (already exists).`);
+                continue;
+              }
+
+              if (dryRun) {
+                core.info(`[DRY RUN] Would create issue '${title}' with labels: ${labels.join(', ') || '(none)'}.`);
+                continue;
+              }
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels,
+              });
+
+              core.info(`Created issue '${title}'.`);
+              existingTitles.add(title);
+            }
+
+            if (dryRun) {
+              core.info('Dry run complete – no issues were created.');
+            }
